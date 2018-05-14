@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
 use std::ops::Deref;
 
+/// AtomicBox<T> is a safe wrapper around AtomicPtr<T>
+/// You can safely swap values using the replace_with method
 struct AtomicBox<T: Sized>
 {
     ptr: Arc<AtomicPtr<T>>,
@@ -10,6 +12,7 @@ struct AtomicBox<T: Sized>
 }
 
 impl<T: Sized> AtomicBox<T> {
+    /// Allocates a new AtomicBox containing the given value
     pub fn new(value: T) -> AtomicBox<T> {
         AtomicBox {
             ptr: Arc::new(AtomicPtr::new(AtomicBox::alloc_from(value))),
