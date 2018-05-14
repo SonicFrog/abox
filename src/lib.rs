@@ -5,7 +5,7 @@ use std::ops::Deref;
 
 /// AtomicBox<T> is a safe wrapper around AtomicPtr<T>
 /// You can safely swap values using the replace_with method
-struct AtomicBox<T: Sized>
+pub struct AtomicBox<T: Sized>
 {
     ptr: Arc<AtomicPtr<T>>,
     refcnt: Arc<AtomicUsize>,
