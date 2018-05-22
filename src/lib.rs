@@ -1,28 +1,28 @@
 use std::mem;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::ops::Deref;
+
 
 /// AtomicBox<T> is a safe wrapper around AtomicPtr<T>
 /// You can safely swap values using the replace_with method
+#[derive(Debug)]
 pub struct AtomicBox<T: Sized>
 {
-    ptr: Arc<AtomicPtr<T>>,
-    refcnt: Arc<AtomicUsize>,
+    ptr: AtomicPtr<T>,
 }
 
 impl<T: Sized> AtomicBox<T> {
     /// Allocates a new AtomicBox containing the given value
     pub fn new(value: T) -> AtomicBox<T> {
         AtomicBox {
-            ptr: Arc::new(AtomicPtr::new(AtomicBox::alloc_from(value))),
-            refcnt: Arc::new(AtomicUsize::new(1)),
+            ptr: AtomicPtr::new(AtomicBox::alloc_from(value)),
         }
     }
 
     #[inline]
     fn alloc_from(value: T) -> *mut T {
-        let total = Arc::new(value);
+        let total: Arc<T> = Arc::new(value);
 
         Arc::into_raw(total) as *mut T
     }
@@ -42,24 +42,32 @@ impl<T: Sized> AtomicBox<T> {
     {
         loop {
             let current = self.ptr.load(Ordering::Relaxed);
-            let new_value = f(&*self);
+            let new_value = f(self);
             let new = AtomicBox::alloc_from(new_value);
 
             if self.compare_and_swap(current, new, Ordering::AcqRel) == current {
-                mem::drop(unsafe { Arc::from_raw(current)});
+                mem::drop(unsafe { Arc::from_raw(current) });
                 break
             }
         }
     }
 }
 
+impl<T: Sized + PartialEq> PartialEq for AtomicBox<T> {
+    fn eq(&self, other: &AtomicBox<T>) -> bool {
+        self == other
+    }
+}
+
 impl<T: Sized> Clone for AtomicBox<T> {
     fn clone(&self) -> AtomicBox<T> {
-        self.refcnt.fetch_add(1, Ordering::AcqRel);
+        let new_arc = unsafe { Arc::from_raw(self.ptr.load(Ordering::Relaxed)) };
+        let new_ptr = Arc::into_raw(Arc::clone(&new_arc)) as *mut T;
+
+        Arc::into_raw(new_arc);
 
         AtomicBox {
-            refcnt: self.refcnt.clone(),
-            ptr: self.ptr.clone(),
+            ptr: AtomicPtr::new(new_ptr),
         }
     }
 }
@@ -76,11 +84,9 @@ impl<T: Sized> Deref for AtomicBox<T> {
 
 impl<T: Sized> Drop for AtomicBox<T> {
     fn drop(&mut self) {
-        if self.refcnt.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let arc = unsafe {
-                Arc::from_raw(self.ptr.load(Ordering::Relaxed));
-            };
-        }
+        unsafe {
+            Arc::from_raw(self.ptr.load(Ordering::Relaxed))
+        };
     }
 }
 
@@ -89,6 +95,7 @@ unsafe impl<T: Sized> Send for AtomicBox<T> {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::thread;
 
     use super::AtomicBox;
@@ -115,7 +122,7 @@ mod tests {
         let value = 1024;
         let b = AtomicBox::new(value);
 
-        for i in 0..10 {
+        for _i in 0..10 {
             b.replace_with(|x| x * 2);
         }
 
@@ -124,18 +131,18 @@ mod tests {
 
     #[test]
     fn atomic_arc_replace_instance() {
-        let b = AtomicBox::new(1024);
+        let b = Arc::new(AtomicBox::new(1024));
         let b1 = b.clone();
 
         b1.replace_with(|x| x * 2);
 
-        assert_eq!(*b, 2048);
+        assert_eq!(**b, 2048);
     }
 
     #[test]
     fn atomic_arc_threaded_leak_test() {
-        let val = AtomicBox::new(10);
-        let val_cpys: Vec<AtomicBox<i32>> = (0..10)
+        let val = Arc::new(AtomicBox::new(10));
+        let val_cpys: Vec<Arc<AtomicBox<i32>>> = (0..10)
             .map(|_| val.clone())
             .collect();
         let mut guards = Vec::new();
@@ -150,10 +157,10 @@ mod tests {
         }
 
         for g in guards {
-            g.join();
+            g.join().unwrap();
         }
 
-        assert_eq!(*val, 10 * 2_i32.pow(10));
+        assert_eq!(**val, 10 * 2_i32.pow(10));
     }
 
     #[test]
@@ -161,7 +168,7 @@ mod tests {
         let values: Vec<i32> = (0..10).map(|x: i32| {
             x.pow(2)
         }).collect();
-        let abox = AtomicBox::new(vec![]);
+        let abox = Arc::new(AtomicBox::new(vec![]));
         let mut guards = Vec::new();
 
         for i in 0..10 {
@@ -178,7 +185,7 @@ mod tests {
         }
 
         for g in guards {
-            g.join();
+            g.join().unwrap();
         }
 
         assert_eq!(abox.len(), values.len());
