@@ -34,22 +34,44 @@ impl<T: Sized> AtomicBox<T> {
         self.ptr.compare_and_swap(current, new, order)
     }
 
-    /// Atomically replace the inner value with the result of applying the
-    /// given closure to the current value, this closure might be executed
-    /// multiple times if the value was swapped concurrently
-    pub fn replace_with<F>(&self, f: F)
-        where F: Fn(&T) -> T
-    {
+    fn take(&self) -> Arc<T> {
         loop {
-            let current = self.ptr.load(Ordering::Relaxed);
-            let new_value = f(self);
-            let new = AtomicBox::alloc_from(new_value);
+            let curr = self.ptr.load(Ordering::Acquire);
+            let null: *mut T = std::ptr::null_mut();
 
-            if self.compare_and_swap(current, new, Ordering::AcqRel) == current {
-                mem::drop(unsafe { Arc::from_raw(current) });
-                break
+            if curr == null {
+                continue;
+            }
+
+            if self.compare_and_swap(curr, null, Ordering::AcqRel) == curr {
+                return unsafe { Arc::from_raw(curr) };
             }
         }
+    }
+
+    fn release(&self, ptr: *mut T) {
+        assert!(ptr != 0xfffffffffffffff0 as *mut T);
+        self.ptr.store(ptr, Ordering::Release);
+    }
+
+    pub fn get(&self) -> Arc<T> {
+        let val = self.take();
+        let copy = Arc::clone(&val);
+        let ptr = Arc::into_raw(val) as *mut T;
+
+        self.release(ptr);
+        copy
+    }
+
+    /// Atomically replace the inner value with the result of applying the
+    /// given closure to the current value
+    pub fn replace_with<F>(&self, f: F)
+        where F: Fn(Arc<T>) -> T
+    {
+        let val = self.take();
+        let new_val = f(val);
+        let ptr = Arc::into_raw(Arc::new(new_val)) as *mut T;
+        self.release(ptr);
     }
 }
 
@@ -59,33 +81,10 @@ impl<T: Sized + PartialEq> PartialEq for AtomicBox<T> {
     }
 }
 
-impl<T: Sized> Clone for AtomicBox<T> {
-    fn clone(&self) -> AtomicBox<T> {
-        let new_arc = unsafe { Arc::from_raw(self.ptr.load(Ordering::Relaxed)) };
-        let new_ptr = Arc::into_raw(Arc::clone(&new_arc)) as *mut T;
-
-        Arc::into_raw(new_arc);
-
-        AtomicBox {
-            ptr: AtomicPtr::new(new_ptr),
-        }
-    }
-}
-
-impl<T: Sized> Deref for AtomicBox<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe {
-            &*self.ptr.load(Ordering::Relaxed)
-        }
-    }
-}
-
 impl<T: Sized> Drop for AtomicBox<T> {
     fn drop(&mut self) {
         unsafe {
-            Arc::from_raw(self.ptr.load(Ordering::Relaxed))
+            Arc::from_raw(self.ptr.load(Ordering::Acquire))
         };
     }
 }
@@ -95,7 +94,7 @@ unsafe impl<T: Sized> Send for AtomicBox<T> {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::AtomicBox;
@@ -104,7 +103,7 @@ mod tests {
     fn atomic_arc_new() {
         let b = AtomicBox::new(1024);
 
-        assert_eq!(*b, 1024);
+        assert_eq!(*b.get(), 1024);
     }
 
     #[test]
@@ -112,9 +111,9 @@ mod tests {
         let value: i64 = 1024;
         let b = AtomicBox::new(value);
 
-        b.replace_with(|x| x  * 2);
+        b.replace_with(|x| *x  * 2);
 
-        assert_eq!(*b, value * 2);
+        assert_eq!(*b.get(), value * 2);
     }
 
     #[test]
@@ -123,10 +122,10 @@ mod tests {
         let b = AtomicBox::new(value);
 
         for _i in 0..10 {
-            b.replace_with(|x| x * 2);
+            b.replace_with(|x| *x * 2);
         }
 
-        assert_eq!(*b, value * 2_i32.pow(10));
+        assert_eq!(*b.get(), value * 2_i32.pow(10));
     }
 
     #[test]
@@ -134,9 +133,9 @@ mod tests {
         let b = Arc::new(AtomicBox::new(1024));
         let b1 = b.clone();
 
-        b1.replace_with(|x| x * 2);
+        b1.replace_with(|x| *x * 2);
 
-        assert_eq!(**b, 2048);
+        assert_eq!(*b.get(), 2048);
     }
 
     #[test]
@@ -150,7 +149,7 @@ mod tests {
         for i in 0..10 {
             let val_cpy = val_cpys[i].clone();
             let guard = thread::spawn(move || {
-                val_cpy.replace_with(|x| x * 2);
+                val_cpy.replace_with(|x| *x * 2);
             });
 
             guards.push(guard);
@@ -160,7 +159,32 @@ mod tests {
             g.join().unwrap();
         }
 
-        assert_eq!(**val, 10 * 2_i32.pow(10));
+        assert_eq!(*val.get(), 10 * 2_i32.pow(10));
+    }
+
+    #[test]
+    fn atomic_arc_threaded_contention() {
+        let abox = Arc::new(AtomicBox::new(0));
+        let thread_num = 10;
+        let mut guards = Vec::new();
+        let barrier = Arc::new(Barrier::new(thread_num));
+
+        for _i in 0..thread_num {
+            let b = Arc::clone(&barrier);
+            let cpy = abox.clone();
+            guards.push(thread::spawn(move || {
+                b.wait();
+                for _j in 0..1000 {
+                    cpy.replace_with(|x| *x + 100)
+                }
+            }));
+        }
+
+        for g in guards {
+            g.join().unwrap();
+        }
+
+        assert_eq!(*abox.get(), thread_num * 1000 * 100);
     }
 
     #[test]
@@ -177,7 +201,7 @@ mod tests {
 
             guards.push(thread::spawn(move || {
                 cpy.replace_with(|x| {
-                    let mut nx = x.clone();
+                    let mut nx = (*x).clone();
                     nx.push(values[i]);
                     nx
                 })
@@ -188,10 +212,10 @@ mod tests {
             g.join().unwrap();
         }
 
-        assert_eq!(abox.len(), values.len());
+        assert_eq!(abox.get().len(), values.len());
 
         for i in values {
-            assert_eq!(abox.contains(&i), true);
+            assert_eq!(abox.get().contains(&i), true);
         }
     }
 }
